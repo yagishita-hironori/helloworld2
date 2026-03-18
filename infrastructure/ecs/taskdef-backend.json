@@ -1,0 +1,36 @@
+{
+  "family": "helloworld2-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::869935101124:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::869935101124:role/helloworld-backend-task-role",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "869935101124.dkr.ecr.ap-northeast-1.amazonaws.com/helloworld2-backend:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "ASPNETCORE_ENVIRONMENT",
+          "value": "Production"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/helloworld2-backend",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

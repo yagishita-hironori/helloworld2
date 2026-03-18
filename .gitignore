@@ -1,0 +1,11 @@
+# .NET
+backend/bin/
+backend/obj/
+
+# Node.js
+frontend/node_modules/
+frontend/.next/
+
+# 環境変数・ローカル設定
+*.env
+*.env.local
