@@ -1,21 +1,21 @@
-async function getHello() {
-  try {
-    const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
-    const res = await fetch(`${backendUrl}/api/hello`, { cache: 'no-store' });
-    const data = await res.json();
-    return data.message;
-  } catch {
-    return 'API に接続できませんでした';
-  }
-}
+'use client';
 
-export default async function Home() {
-  const message = await getHello();
+import { useEffect, useState } from 'react';
+
+export default function Home() {
+  const [message, setMessage] = useState('読み込み中...');
+
+  useEffect(() => {
+    fetch('/api/hello')
+      .then(res => res.json())
+      .then(data => setMessage(data.message))
+      .catch(() => setMessage('API に接続できませんでした'));
+  }, []);
 
   return (
     <div style={{ textAlign: 'center', marginTop: '4rem', fontFamily: 'sans-serif' }}>
       <h1>{message}</h1>
-      <p>React SPA (Next.js) + ASP.NET Core API on ECS/Fargate2</p>
+      <p>React SPA (Next.js) + ASP.NET Core API on ECS/Fargate</p>
     </div>
   );
 }

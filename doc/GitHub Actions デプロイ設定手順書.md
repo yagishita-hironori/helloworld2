@@ -1,7 +1,7 @@
 # GitHub Actions デプロイ設定手順書
 
 **作成日:** 2026-03-18
-**対象リポジトリ:** https://github.com/yagishita-hironori/helloworld
+**対象リポジトリ:** https://github.com/yagishita-hironori/helloworld2
 **AWS アカウント ID:** 869935101124
 **AWS リージョン:** ap-northeast-1 (東京)
 
@@ -25,35 +25,237 @@ git push origin main
 
 ---
 
+## beans-web-test との主な差分
+
+| 項目 | beans-web-test (元) | beans-web-test2 (本プロジェクト) |
+|---|---|---|
+| フロントエンド | React SPA / Nginx | Next.js / Node.js |
+| コンテナポート | 80 | 3000 |
+| フロントエCS メモリ | 512 MB | 1024 MB |
+| ECR リポジトリ | helloworld-frontend/backend | helloworld2-frontend/backend |
+| ECS クラスター | helloworld-cluster | helloworld2-cluster |
+| ヘルスチェック実装 | Nginx の location /health | Next.js Route Handler |
+
+---
+
 ## 前提条件
 
 - AWS CLI がインストール済みで、必要な権限を持つユーザーでログインしていること
-- ECR リポジトリが作成済みであること
-- ECS クラスター・サービスが作成済みであること
-- GitHub リポジトリが作成済みであること
+- 元プロジェクト (beans-web-test) の VPC・サブネット・ALB が作成済みであること
+- GitHub リポジトリ (`helloworld2`) が作成済みであること
 
 ---
 
-## Step 1: OIDC プロバイダーを AWS に登録する
+## Step 1: アプリケーションコードの修正
 
-GitHub Actions が AWS に認証するための OIDC プロバイダーを登録する。
+### 1-1. ヘルスチェックエンドポイントの追加
 
-```bash
-aws iam create-open-id-connect-provider `
-  --url https://token.actions.githubusercontent.com `
-  --client-id-list sts.amazonaws.com `
-  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+Next.js には Nginx のような組み込みヘルスチェック機能がないため、Route Handler で実装する。
+
+`frontend/app/health/route.js` を作成:
+
+```js
+export async function GET() {
+  return new Response('ok', { status: 200 });
+}
 ```
 
-> **注意:** すでに登録済みの場合はスキップしてください。
+> **注意:** `/api/health` ではなく `/health` に配置すること。ALB のリスナールールで `/api/*` はバックエンドに転送されるため、`/api/health` はフロントエンドに届かない。
+
+### 1-2. バックエンド URL の環境変数化
+
+`frontend/app/page.jsx` の API 呼び出しをハードコードから環境変数に変更:
+
+```js
+// 変更前
+const res = await fetch('http://localhost:5000/api/hello', { cache: 'no-store' });
+
+// 変更後
+const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
+const res = await fetch(`${backendUrl}/api/hello`, { cache: 'no-store' });
+```
+
+### 1-3. Dockerfile の修正
+
+`frontend/Dockerfile` の runtime ステージから存在しない `public/` ディレクトリのコピーを削除:
+
+```dockerfile
+# 削除する行
+COPY --from=build /app/public ./public
+```
 
 ---
 
-## Step 2: GitHub Actions 用 IAM ロールを作成する
+## Step 2: ECR リポジトリを作成する
 
-### 2-1. 信頼ポリシーファイルを確認する
+```bash
+aws ecr create-repository --repository-name helloworld2-frontend --region ap-northeast-1
+aws ecr create-repository --repository-name helloworld2-backend  --region ap-northeast-1
+```
 
-[infrastructure/github-oidc/oidc-role-policy.json](../infrastructure/github-oidc/oidc-role-policy.json) の内容:
+---
+
+## Step 3: CloudWatch Logs グループを作成する
+
+```bash
+aws logs create-log-group --log-group-name /ecs/helloworld2-frontend --region ap-northeast-1
+aws logs create-log-group --log-group-name /ecs/helloworld2-backend  --region ap-northeast-1
+```
+
+---
+
+## Step 4: ECS クラスターを作成する
+
+```bash
+aws ecs create-cluster --cluster-name helloworld2-cluster --region ap-northeast-1
+```
+
+---
+
+## Step 5: セキュリティグループを作成する
+
+元プロジェクトの ALB SG (`sg-0c289176d3f0c997b`) からの通信を許可する。
+フロントエンドのポートが **80 → 3000** に変わっている点に注意。
+
+```bash
+# フロントエンド用 SG（ポート 3000）
+aws ec2 create-security-group \
+  --group-name helloworld2-frontend-sg \
+  --description "helloworld2 frontend ECS SG" \
+  --vpc-id vpc-0fd0c9087e34aeff0
+
+aws ec2 authorize-security-group-ingress \
+  --group-id <FRONTEND_SG_ID> \
+  --protocol tcp --port 3000 \
+  --source-group sg-0c289176d3f0c997b
+
+# バックエンド用 SG（ポート 8080）
+aws ec2 create-security-group \
+  --group-name helloworld2-backend-sg \
+  --description "helloworld2 backend ECS SG" \
+  --vpc-id vpc-0fd0c9087e34aeff0
+
+aws ec2 authorize-security-group-ingress \
+  --group-id <BACKEND_SG_ID> \
+  --protocol tcp --port 8080 \
+  --source-group sg-0c289176d3f0c997b
+```
+
+---
+
+## Step 6: ターゲットグループを作成する
+
+```bash
+# フロントエンド用（ポート 3000）
+aws elbv2 create-target-group \
+  --name helloworld2-frontend-tg \
+  --protocol HTTP \
+  --port 3000 \
+  --target-type ip \
+  --vpc-id vpc-0fd0c9087e34aeff0 \
+  --health-check-path /health \
+  --region ap-northeast-1
+
+# バックエンド用（ポート 8080）
+aws elbv2 create-target-group \
+  --name helloworld2-backend-tg \
+  --protocol HTTP \
+  --port 8080 \
+  --target-type ip \
+  --vpc-id vpc-0fd0c9087e34aeff0 \
+  --health-check-path /health \
+  --region ap-northeast-1
+```
+
+> **注意:** ターゲットグループ作成後、ALB リスナーへの紐付けを先に完了してから ECS サービスを作成すること（順序を誤ると `InvalidParameterException` が発生する）。
+
+---
+
+## Step 7: ALB リスナーを設定する
+
+既存の ALB リスナーのデフォルトアクションをフロントエンド TG に向け、`/api/*` をバックエンド TG に転送するルールを追加する。
+
+```bash
+# デフォルトアクションをフロントエンド TG に変更
+aws elbv2 modify-listener \
+  --listener-arn arn:aws:elasticloadbalancing:ap-northeast-1:869935101124:listener/app/helloworld-alb/bce042332b67c396/f00bc3088ba256df \
+  --default-actions Type=forward,TargetGroupArn=<FRONTEND_TG_ARN> \
+  --region ap-northeast-1
+
+# /api/* をバックエンド TG に転送するルールを追加
+aws elbv2 create-rule \
+  --listener-arn arn:aws:elasticloadbalancing:ap-northeast-1:869935101124:listener/app/helloworld-alb/bce042332b67c396/f00bc3088ba256df \
+  --priority 20 \
+  --conditions '[{"Field":"path-pattern","Values":["/api/*"]}]' \
+  --actions '[{"Type":"forward","TargetGroupArn":"<BACKEND_TG_ARN>"}]' \
+  --region ap-northeast-1
+```
+
+> **権限が不足している場合:** AWS コンソール (EC2 → Load Balancers → Listeners) から手動で設定する。
+
+---
+
+## Step 8: ECS タスク定義を登録する
+
+`infrastructure/ecs/taskdef-frontend.json` の `BACKEND_URL` には ALB の URL を設定する。
+Next.js の SSR はサーバーサイドでバックエンドを呼び出すため、`localhost` や ECS サービス名（サービスディスカバリー未設定時）は使用できない。
+
+```json
+{
+  "name": "BACKEND_URL",
+  "value": "http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com"
+}
+```
+
+タスク定義を登録:
+
+```bash
+aws ecs register-task-definition \
+  --cli-input-json file://infrastructure/ecs/taskdef-frontend.json \
+  --region ap-northeast-1
+
+aws ecs register-task-definition \
+  --cli-input-json file://infrastructure/ecs/taskdef-backend.json \
+  --region ap-northeast-1
+```
+
+---
+
+## Step 9: ECS サービスを作成する
+
+> **重要:** Step 7 の ALB リスナー設定を完了してから実行すること。
+
+```bash
+# フロントエンド
+aws ecs create-service \
+  --cluster helloworld2-cluster \
+  --service-name helloworld2-frontend-service \
+  --task-definition helloworld2-frontend \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-0fa641440660db889,subnet-0c55a4e73f31be9b7],securityGroups=[<FRONTEND_SG_ID>],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=<FRONTEND_TG_ARN>,containerName=frontend,containerPort=3000" \
+  --region ap-northeast-1
+
+# バックエンド
+aws ecs create-service \
+  --cluster helloworld2-cluster \
+  --service-name helloworld2-backend-service \
+  --task-definition helloworld2-backend \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[subnet-0fa641440660db889,subnet-0c55a4e73f31be9b7],securityGroups=[<BACKEND_SG_ID>],assignPublicIp=ENABLED}" \
+  --load-balancers "targetGroupArn=<BACKEND_TG_ARN>,containerName=backend,containerPort=8080" \
+  --region ap-northeast-1
+```
+
+---
+
+## Step 10: OIDC と IAM ロールを設定する
+
+### 10-1. 信頼ポリシーファイルを確認する
+
+`infrastructure/github-oidc/trust-policy-helloworld2.json`:
 
 ```json
 {
@@ -70,7 +272,7 @@ aws iam create-open-id-connect-provider `
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:yagishita-hironori/helloworld:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:yagishita-hironori/helloworld2:ref:refs/heads/main"
         }
       }
     }
@@ -78,139 +280,93 @@ aws iam create-open-id-connect-provider `
 }
 ```
 
-> **ポイント:** `sub` 条件により `yagishita-hironori/helloworld` リポジトリの `main` ブランチからのみ AssumeRole を許可している。
-
-### 2-2. IAM ロールを作成する
+### 10-2. IAM ロールを作成してポリシーをアタッチする
 
 ```bash
-aws iam create-role `
-  --role-name github-actions-helloworld-deploy `
-  --assume-role-policy-document file://C:/repos/beans-web-test/infrastructure/github-oidc/oidc-role-policy.json
+aws iam create-role \
+  --role-name github-actions-helloworld2-deploy \
+  --assume-role-policy-document file://infrastructure/github-oidc/trust-policy-helloworld2.json
+
+aws iam create-policy \
+  --policy-name helloworld2-deploy-policy \
+  --policy-document file://infrastructure/github-oidc/deploy-permissions-policy-helloworld2.json
+
+aws iam attach-role-policy \
+  --role-name github-actions-helloworld2-deploy \
+  --policy-arn arn:aws:iam::869935101124:policy/helloworld2-deploy-policy
 ```
 
----
-
-## Step 3: デプロイ用 IAM ポリシーを作成してアタッチする
-
-### 3-1. ポリシーファイルを確認する
-
-[infrastructure/github-oidc/deploy-permissions-policy.json](../infrastructure/github-oidc/deploy-permissions-policy.json) の権限内容:
+`infrastructure/github-oidc/deploy-permissions-policy-helloworld2.json` の権限内容:
 
 | Sid | 権限 | 対象リソース |
 |---|---|---|
 | ECRAuth | ECR 認証トークン取得 | * |
-| ECRPush | ECR へのイメージ push | helloworld-frontend / helloworld-backend リポジトリ |
+| ECRPush | ECR へのイメージ push | helloworld2-frontend / helloworld2-backend |
 | ECSDeployRead | ECS タスク定義・サービスの参照 | * |
 | ECSDeployWrite | ECS タスク定義の登録・サービス更新 | * |
 | PassRoleToECS | ECS タスクへのロール付与 | ecsTaskExecutionRole / helloworld-backend-task-role |
 
-### 3-2. ポリシーを作成してロールにアタッチする
-
-```bash
-aws iam create-policy `
-  --policy-name helloworld-deploy-policy `
-  --policy-document file://C:/repos/beans-web-test/infrastructure/github-oidc/deploy-permissions-policy.json
-
-aws iam attach-role-policy `
-  --role-name github-actions-helloworld-deploy `
-  --policy-arn arn:aws:iam::869935101124:policy/helloworld-deploy-policy
-```
-
-### 3-3. ロール ARN を確認する
-
-```bash
-aws iam get-role `
-  --role-name github-actions-helloworld-deploy `
-  --query 'Role.Arn' `
-  --output text
-# → arn:aws:iam::869935101124:role/github-actions-helloworld-deploy
-```
-
 ---
 
-## Step 4: GitHub Secret を登録する
+## Step 11: GitHub Secret を登録する
 
-GitHub リポジトリの **Settings → Secrets and variables → Actions → New repository secret** に以下を登録する。
+`https://github.com/yagishita-hironori/helloworld2/settings/secrets/actions` にアクセスして登録:
 
 | Secret 名 | 値 |
 |---|---|
-| `AWS_ROLE_ARN` | `arn:aws:iam::869935101124:role/github-actions-helloworld-deploy` |
-
-設定画面の URL:
-```
-https://github.com/yagishita-hironori/helloworld/settings/secrets/actions
-```
+| `AWS_ROLE_ARN` | `arn:aws:iam::869935101124:role/github-actions-helloworld2-deploy` |
 
 ---
 
-## Step 5: GitHub Actions ワークフローを確認する
-
-### フロントエンド: deploy-frontend.yml
-
-**トリガー:** `frontend/**` または `.github/workflows/deploy-frontend.yml` が変更されて `main` に push された場合
-
-**環境変数:**
-
-| 変数名 | 値 |
-|---|---|
-| AWS_REGION | ap-northeast-1 |
-| ECR_REPOSITORY | helloworld-frontend |
-| ECS_CLUSTER | helloworld-cluster |
-| ECS_SERVICE | helloworld-frontend-service |
-| CONTAINER_NAME | frontend |
-| TASK_DEFINITION | infrastructure/ecs/taskdef-frontend.json |
-
-**実行ステップ:**
-
-1. Checkout
-2. AWS 認証 (OIDC)
-3. ECR ログイン
-4. Docker ビルド & ECR push (タグ: git commit SHA)
-5. ECS タスク定義を新イメージで更新
-6. ECS サービス ローリングアップデート (安定確認まで待機)
-
-### バックエンド: deploy-backend.yml
-
-**トリガー:** `backend/**` または `.github/workflows/deploy-backend.yml` が変更されて `main` に push された場合
-
-**環境変数:**
-
-| 変数名 | 値 |
-|---|---|
-| AWS_REGION | ap-northeast-1 |
-| ECR_REPOSITORY | helloworld-backend |
-| ECS_CLUSTER | helloworld-cluster |
-| ECS_SERVICE | helloworld-backend-service |
-| CONTAINER_NAME | backend |
-| TASK_DEFINITION | infrastructure/ecs/taskdef-backend.json |
-
-**実行ステップ:** フロントエンドと同様
-
----
-
-## Step 6: 動作確認
-
-`frontend/` または `backend/` 配下のファイルを変更して `main` に push する。
+## Step 12: Git リポジトリを初期化して push する
 
 ```bash
-git add frontend/   # または backend/
-git commit -m "任意のメッセージ"
-git push origin main
+git init
+git branch -M main
+git remote add origin https://github.com/yagishita-hironori/helloworld2.git
+git add .
+git commit -m "initial commit"
+git push -u origin main
 ```
 
-GitHub Actions の実行状況を確認する:
-```
-https://github.com/yagishita-hironori/helloworld/actions
-```
+push 後、`frontend/**` と `backend/**` の変更が含まれるため両ワークフローが起動する。
 
-デプロイ完了後、ALB の URL でアクセスして動作確認する:
-```
-http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com
-```
+---
+
+## 動作確認
+
+| エンドポイント | 期待する結果 |
+|---|---|
+| `http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com` | Hello World のメッセージが表示される |
+| `http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com/health` | `ok` が返る |
+| `http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com/api/hello` | `{"message":"Hello World..."}` が返る |
 
 ---
 
 ## トラブルシューティング
+
+### Dockerfile ビルドエラー: `/app/public` not found
+
+Next.js プロジェクトに `public/` ディレクトリが存在しない場合に発生。
+`frontend/Dockerfile` の以下の行を削除する:
+
+```dockerfile
+COPY --from=build /app/public ./public
+```
+
+### ECS サービス作成エラー: target group does not have an associated load balancer
+
+ALB リスナーへの紐付け（Step 7）を先に完了してから ECS サービスを作成する。
+
+### フロントエンドで「API に接続できませんでした」
+
+`frontend/app/page.jsx` が `http://localhost:5000` にハードコードされている場合に発生。
+`BACKEND_URL` 環境変数を使用するよう修正し、`taskdef-frontend.json` に ALB の URL を設定する。
+
+### ヘルスチェック `/api/health` が 404
+
+ALB のリスナールールで `/api/*` はバックエンドに転送されるため、フロントエンドのヘルスチェックは `/health` に配置する。
+Next.js Route Handler は `frontend/app/health/route.js` に作成する。
 
 ### OIDC 認証エラー
 
@@ -218,23 +374,28 @@ http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com
 Error: Could not assume role with OIDC
 ```
 
-**原因:** `oidc-role-policy.json` のリポジトリ名・ブランチ名が一致していない
-**対処:** IAM ロールの信頼ポリシーの `sub` 条件を確認する
+`trust-policy-helloworld2.json` のリポジトリ名・ブランチ名が一致していない。
+IAM ロールの信頼ポリシーの `sub` 条件を確認する。
 
-### ECR push エラー
+### ECR push エラー: ecr:InitiateLayerUpload
 
-```
-Error: denied: User is not authorized to perform: ecr:InitiateLayerUpload
-```
+`helloworld2-deploy-policy` の ECRPush 権限が `helloworld2-frontend/backend` リポジトリを対象としているか確認する。
+元プロジェクトの `helloworld-deploy-policy` は `helloworld-*` のみ対象のため流用不可。
 
-**原因:** `helloworld-deploy-policy` の ECRPush 権限が不足している
-**対処:** `deploy-permissions-policy.json` の `Resource` に対象リポジトリが含まれているか確認する
+---
 
-### ECS デプロイが安定しない
+## AWS リソース一覧
 
-```
-Error: Service did not stabilize
-```
-
-**原因:** 新しいタスクが起動に失敗している
-**対処:** AWS コンソールの ECS サービスイベントまたは CloudWatch Logs (`/ecs/helloworld-frontend`, `/ecs/helloworld-backend`) でエラー内容を確認する
+| リソース | 名前 / ID |
+|---|---|
+| ECR (frontend) | `helloworld2-frontend` |
+| ECR (backend) | `helloworld2-backend` |
+| ECS クラスター | `helloworld2-cluster` |
+| ECS サービス (frontend) | `helloworld2-frontend-service` |
+| ECS サービス (backend) | `helloworld2-backend-service` |
+| CloudWatch Logs (frontend) | `/ecs/helloworld2-frontend` |
+| CloudWatch Logs (backend) | `/ecs/helloworld2-backend` |
+| IAM ロール | `github-actions-helloworld2-deploy` |
+| IAM ポリシー | `helloworld2-deploy-policy` |
+| ALB | `helloworld-alb`（元プロジェクトから流用） |
+| VPC | `vpc-0fd0c9087e34aeff0`（元プロジェクトから流用） |
