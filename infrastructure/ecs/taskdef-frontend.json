@@ -19,7 +19,7 @@
       "environment": [
         {
           "name": "BACKEND_URL",
-          "value": "http://helloworld2-backend-service"
+          "value": "http://helloworld-alb-407709868.ap-northeast-1.elb.amazonaws.com"
         }
       ],
       "logConfiguration": {

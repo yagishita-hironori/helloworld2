@@ -1,6 +1,7 @@
 async function getHello() {
   try {
-    const res = await fetch('http://localhost:5000/api/hello', { cache: 'no-store' });
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:5000';
+    const res = await fetch(`${backendUrl}/api/hello`, { cache: 'no-store' });
     const data = await res.json();
     return data.message;
   } catch {
